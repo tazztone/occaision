@@ -54,28 +54,12 @@ UPLOAD_CHUNK_SIZE = 256 * 1024       # 256 KB streaming chunks
 
 
 def configure_logging(level_name: Optional[str] = None):
-    """Set log level on all occaision.* loggers based on CLI args, env var, or config."""
-    cli_level = None
-    for i, arg in enumerate(sys.argv):
-        if arg in ("--log-level", "-l") and i + 1 < len(sys.argv):
-            cli_level = sys.argv[i + 1].upper()
-            break
-        elif arg.startswith("--log-level="):
-            cli_level = arg.split("=", 1)[1].upper()
-            break
-
-    effective_name = (
-        cli_level
-        or os.environ.get("LOG_LEVEL")
-        or level_name
-        or "INFO"
-    ).upper()
-
+    """Set log level on all occaision.* loggers based on env var or config."""
+    effective_name = (os.environ.get("LOG_LEVEL") or level_name or "INFO").upper()
     level = getattr(logging, effective_name, logging.INFO)
 
     for name in ["occaision", "occaision.api", "occaision.image", "occaision.ai", "occaision.ebay"]:
-        named_logger = logging.getLogger(name)
-        named_logger.setLevel(level)
+        logging.getLogger(name).setLevel(level)
 
     if level == logging.DEBUG:
         logger.info("[Logging] Debug-Logging ist AKTIV (vollständige Prompts und Antworten werden ausgegeben).")
@@ -169,68 +153,19 @@ class UpdateSystemConfigRequest(BaseModel):
 
 
 def merge_analysis_results(base: Draft, current: Draft, analyzed: Draft) -> Draft:
-    """Merge AI analysis results into current draft preserving any fields modified by the user."""
-    # Ricardo
-    if current.ricardo.title == base.ricardo.title:
-        current.ricardo.title = analyzed.ricardo.title
-    if current.ricardo.description == base.ricardo.description:
-        current.ricardo.description = analyzed.ricardo.description
-    if current.ricardo.condition == base.ricardo.condition:
-        current.ricardo.condition = analyzed.ricardo.condition
-    if current.ricardo.start_price_chf == base.ricardo.start_price_chf:
-        current.ricardo.start_price_chf = analyzed.ricardo.start_price_chf
-    if current.ricardo.buynow_price_chf == base.ricardo.buynow_price_chf:
-        current.ricardo.buynow_price_chf = analyzed.ricardo.buynow_price_chf
+    """Merge AI analysis results into current draft preserving fields modified by user."""
+    for platform in ("ricardo", "tutti", "ebay_de", "kleinanzeigen"):
+        c_m, b_m, a_m = getattr(current, platform), getattr(base, platform), getattr(analyzed, platform)
+        for field in type(c_m).model_fields:
+            if getattr(c_m, field) == getattr(b_m, field):
+                setattr(c_m, field, getattr(a_m, field))
 
-    # Tutti
-    if current.tutti.title == base.tutti.title:
-        current.tutti.title = analyzed.tutti.title
-    if current.tutti.description == base.tutti.description:
-        current.tutti.description = analyzed.tutti.description
-    if current.tutti.category_suggestion == base.tutti.category_suggestion:
-        current.tutti.category_suggestion = analyzed.tutti.category_suggestion
-    if current.tutti.condition == base.tutti.condition:
-        current.tutti.condition = analyzed.tutti.condition
-    if current.tutti.price_vhb_chf == base.tutti.price_vhb_chf:
-        current.tutti.price_vhb_chf = analyzed.tutti.price_vhb_chf
-
-    # eBay DE
-    if current.ebay_de.title == base.ebay_de.title:
-        current.ebay_de.title = analyzed.ebay_de.title
-    if current.ebay_de.description == base.ebay_de.description:
-        current.ebay_de.description = analyzed.ebay_de.description
-    if current.ebay_de.category_suggestion == base.ebay_de.category_suggestion:
-        current.ebay_de.category_suggestion = analyzed.ebay_de.category_suggestion
-    if current.ebay_de.condition == base.ebay_de.condition:
-        current.ebay_de.condition = analyzed.ebay_de.condition
-    if current.ebay_de.start_price_eur == base.ebay_de.start_price_eur:
-        current.ebay_de.start_price_eur = analyzed.ebay_de.start_price_eur
-    if current.ebay_de.buynow_price_eur == base.ebay_de.buynow_price_eur:
-        current.ebay_de.buynow_price_eur = analyzed.ebay_de.buynow_price_eur
-
-    # Kleinanzeigen
-    if current.kleinanzeigen.title == base.kleinanzeigen.title:
-        current.kleinanzeigen.title = analyzed.kleinanzeigen.title
-    if current.kleinanzeigen.description == base.kleinanzeigen.description:
-        current.kleinanzeigen.description = analyzed.kleinanzeigen.description
-    if current.kleinanzeigen.category_suggestion == base.kleinanzeigen.category_suggestion:
-        current.kleinanzeigen.category_suggestion = analyzed.kleinanzeigen.category_suggestion
-    if current.kleinanzeigen.condition == base.kleinanzeigen.condition:
-        current.kleinanzeigen.condition = analyzed.kleinanzeigen.condition
-    if current.kleinanzeigen.price_eur == base.kleinanzeigen.price_eur:
-        current.kleinanzeigen.price_eur = analyzed.kleinanzeigen.price_eur
-    if current.kleinanzeigen.price_type == base.kleinanzeigen.price_type:
-        current.kleinanzeigen.price_type = analyzed.kleinanzeigen.price_type
-
-    # Identified product
     if not current.identified_product or current.identified_product == base.identified_product:
         current.identified_product = analyzed.identified_product
 
-    # Hints, Price Analysis & Status
     current.price_analysis = analyzed.price_analysis
     current.missing_photo_hints = analyzed.missing_photo_hints
     current.status = DraftStatus.READY if is_draft_ready(current) else DraftStatus.DRAFT
-
     return current
 
 
