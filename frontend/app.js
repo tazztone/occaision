@@ -80,6 +80,7 @@ const tuttiCategory = document.getElementById("tutti-category");
 const tuttiCondition = document.getElementById("tutti-condition");
 const tuttiPrice = document.getElementById("tutti-price");
 const tuttiDescription = document.getElementById("tutti-description");
+const tuttiDescriptionCount = document.getElementById("tutti-description-count");
 
 const ebayDeTitle = document.getElementById("ebay-de-title");
 const ebayDeTitleCount = document.getElementById("ebay-de-title-count");
@@ -118,13 +119,17 @@ const btnExportBackup = document.getElementById("btn-export-backup");
 const backupFileInput = document.getElementById("backup-file-input");
 const toastContainer = document.getElementById("toast-container");
 
-function showToast(message, type = "info", options = {}) {
-  if (typeof window !== "undefined" && typeof window.showToast === "function") {
-    return window.showToast(message, type, options);
-  }
-  console.log(`[${type}] ${message}`);
-  return null;
-}
+const showToast = (typeof window !== "undefined" && typeof window.showToast === "function")
+  ? (...args) => window.showToast(...args)
+  : (message, type = "info", options = {}) => {
+      if (typeof require !== "undefined") {
+        try {
+          return require("./toast.js").showToast(message, type, options);
+        } catch (_) {}
+      }
+      console.log(`[${type}] ${message}`);
+      return null;
+    };
 
 let systemConfig = null;
 
@@ -563,11 +568,14 @@ function populateForm() {
 
   // Tutti
   tuttiTitle.value = currentDraft.tutti.title || "";
-  updateCharCounter(tuttiTitle, tuttiTitleCount, 80);
+  updateCharCounter(tuttiTitle, tuttiTitleCount, 60);
   tuttiCategory.value = currentDraft.tutti.category_suggestion || "";
   tuttiCondition.value = currentDraft.tutti.condition || "gebraucht";
   tuttiPrice.value = currentDraft.tutti.price_vhb_chf || 10.0;
   tuttiDescription.value = currentDraft.tutti.description || "";
+  if (tuttiDescriptionCount) {
+    updateCharCounter(tuttiDescription, tuttiDescriptionCount, 4000);
+  }
 
   // eBay.de
   if (currentDraft.ebay_de && ebayDeTitle) {
@@ -870,7 +878,10 @@ function setupEventListeners() {
   window.addEventListener("drop", e => e.preventDefault());
 
   ricardoTitle.oninput = () => updateCharCounter(ricardoTitle, ricardoTitleCount, 60);
-  tuttiTitle.oninput = () => updateCharCounter(tuttiTitle, tuttiTitleCount, 80);
+  tuttiTitle.oninput = () => updateCharCounter(tuttiTitle, tuttiTitleCount, 60);
+  if (tuttiDescription && tuttiDescriptionCount) {
+    tuttiDescription.oninput = () => updateCharCounter(tuttiDescription, tuttiDescriptionCount, 4000);
+  }
   if (ebayDeTitle) {
     ebayDeTitle.oninput = () => updateCharCounter(ebayDeTitle, ebayDeTitleCount, 80);
   }

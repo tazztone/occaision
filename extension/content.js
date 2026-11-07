@@ -1,7 +1,9 @@
 // Content Script for OccAIsion Smart-Panel
 // Injected into ricardo.ch and tutti.ch listing creation wizards.
 
-const browserApi = typeof browser !== "undefined" ? browser : (typeof chrome !== "undefined" ? chrome : null);
+const browserApi = new Proxy({}, {
+  get: (target, prop) => (typeof browser !== "undefined" ? browser : (typeof chrome !== "undefined" ? chrome : null))?.[prop]
+});
 
 // Helper: Convert Data URL to Uint8Array
 function dataUrlToUint8Array(dataUrl) {
@@ -38,14 +40,27 @@ function setNativeValue(element, value) {
     target.dispatchEvent(new Event("focus", { bubbles: true }));
   } catch (e) {}
 
+  if (target._valueTracker) {
+    try {
+      target._valueTracker.setValue(strVal === "" ? " " : "");
+    } catch (_) {}
+  }
+
   if (descriptor && descriptor.set) {
     descriptor.set.call(target, strVal);
   } else {
     target.value = strVal;
   }
 
-  target.dispatchEvent(new Event("input", { bubbles: true }));
-  target.dispatchEvent(new Event("change", { bubbles: true }));
+  try {
+    target.dispatchEvent(new Event("input", { bubbles: true }));
+    target.dispatchEvent(new Event("change", { bubbles: true }));
+    if (element !== target) {
+      element.dispatchEvent(new Event("input", { bubbles: true }));
+      element.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+  } catch (e) {}
+
   try {
     target.dispatchEvent(new Event("blur", { bubbles: true }));
   } catch (e) {}
@@ -458,19 +473,184 @@ async function autoSelectTuttiCategory(suggestion, productTitle) {
   return { ok: finalCheck, status: finalCheck ? "selected" : "manual_selection_required" };
 }
 
+// eBay.de Prelist, Condition Dialog & Listing Helpers
+async function handleEbayPrelistStep1(draft, data, rootDoc) {
+  const doc = rootDoc || (typeof document !== "undefined" ? document : null);
+  if (!doc) return false;
+
+  const keywordInput = doc.querySelector(
+    'input[id*="search-textbox" i], input[id*="simplified-keyword" i], input.sell-search-simplified__textbox, input[name="keyword"], input.textbox__control[maxlength="80"]'
+  );
+  if (keywordInput && (!keywordInput.value || keywordInput.value.trim() === "")) {
+    const textToFill = (data && data.title) || (draft && (draft.identified_product || draft.user_notes)) || "";
+    if (textToFill) {
+      setNativeValue(keywordInput, textToFill);
+
+      // Dispatch Enter key to initiate search directly
+      try {
+        const enterEv = new KeyboardEvent("keydown", {
+          key: "Enter",
+          code: "Enter",
+          keyCode: 13,
+          which: 13,
+          bubbles: true,
+          cancelable: true
+        });
+        keywordInput.dispatchEvent(enterEv);
+      } catch (_) {}
+
+      const nextBtn = doc.querySelector(
+        'button.sell-search-simplified__next-action, button[class*="sell-search-simplified"][class*="next-action"]'
+      );
+      if (nextBtn) {
+        // Wait for React to process input event and remove disabled state
+        let waitTicks = 0;
+        while (waitTicks < 15 && (nextBtn.disabled || nextBtn.hasAttribute("disabled") || nextBtn.getAttribute("aria-disabled") === "true")) {
+          await new Promise(r => setTimeout(r, 100));
+          waitTicks++;
+        }
+        nextBtn.removeAttribute("disabled");
+        nextBtn.disabled = false;
+        try { nextBtn.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true })); } catch (_) {}
+        try { nextBtn.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true })); } catch (_) {}
+        try {
+          nextBtn.click();
+        } catch (_) {}
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+async function handleEbayConditionDialog(condition, rootDoc) {
+  const doc = rootDoc || (typeof document !== "undefined" ? document : null);
+  if (!doc) return false;
+
+  const condVal = (condition || "gebraucht").toLowerCase();
+  let targetCode = "3000"; // default: Gebraucht (3000)
+  if (condVal.includes("neu") && !condVal.includes("neuwertig") && !condVal.includes("sonstige")) {
+    targetCode = "1000";
+  } else if (condVal.includes("neuwertig") || condVal.includes("wie neu") || condVal.includes("sonstige")) {
+    targetCode = "1500";
+  } else if (condVal.includes("defekt") || condVal.includes("ersatzteil")) {
+    targetCode = "7000";
+  }
+
+  const radio = doc.querySelector(
+    `input[type="radio"][name="condition"][value="${targetCode}"], input[type="radio"][name="condition"][value*="${targetCode.slice(0, 2)}"]`
+  ) || doc.querySelector('input[type="radio"][name="condition"][value="3000"]');
+
+  if (radio) {
+    radio.checked = true;
+    try { radio.focus?.(); } catch (_) {}
+    if (typeof radio.click === "function") radio.click();
+    const label = (typeof radio.closest === "function" ? radio.closest("label") : null) || radio.parentElement;
+    if (label && label !== radio) {
+      try { label.click(); } catch (_) {}
+    }
+    radio.dispatchEvent(new Event("change", { bubbles: true }));
+    radio.dispatchEvent(new Event("input", { bubbles: true }));
+
+    const continueBtn = doc.querySelector(
+      "button.condition-dialog-radix__continue-btn, button[class*='condition-dialog'][class*='continue']"
+    );
+    if (continueBtn) {
+      // Wait for React to process state and remove disabled
+      let waitTicks = 0;
+      while (waitTicks < 20 && (continueBtn.disabled || continueBtn.hasAttribute("disabled") || continueBtn.getAttribute("aria-disabled") === "true")) {
+        await new Promise(r => setTimeout(r, 100));
+        waitTicks++;
+      }
+      continueBtn.removeAttribute("disabled");
+      continueBtn.disabled = false;
+      try { continueBtn.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true })); } catch (_) {}
+      try { continueBtn.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true })); } catch (_) {}
+      try {
+        continueBtn.click();
+      } catch (_) {}
+      return true;
+    }
+    return true;
+  }
+  return false;
+}
+
+async function fillEbayDEPricesAndFormat(draft, data, rootDoc) {
+  const doc = rootDoc || (typeof document !== "undefined" ? document : null);
+  if (!doc) return;
+
+  const d = data || getPlatformData(draft, "ebay_de");
+  const isFixedPrice = d.priceType === "fixed_price" || d.priceType === "fixed";
+
+  // 1. Format
+  const formatSelect = doc.querySelector('select[name="format"], select[id*="format" i]');
+  if (formatSelect) {
+    const targetVal = isFixedPrice ? "FixedPrice" : "ChineseAuction";
+    formatSelect.value = targetVal;
+    formatSelect.dispatchEvent(new Event("change", { bubbles: true }));
+
+    const formatBtn = formatSelect.parentElement?.querySelector(".listbox-button__control, button");
+    if (formatBtn) {
+      formatBtn.textContent = isFixedPrice ? "Sofort-Kaufen" : "Auktion";
+    }
+  }
+
+  // 2. Prices
+  if (!isFixedPrice) {
+    const startPriceInput = doc.querySelector(
+      'input[name="startPrice"], input[name*="startPrice" i], input[id*="start-price" i], input[id*="start_price" i], input[aria-label*="Startpreis" i], input[data-testid*="start-price" i]'
+    );
+    if (startPriceInput && d.startPrice !== null && d.startPrice !== undefined) {
+      setNativeValue(startPriceInput, String(d.startPrice).replace(".", ","));
+    }
+  }
+
+  const buynowPriceInput = doc.querySelector(
+    'input[name="price"], input[name*="buyNowPrice" i], input[name*="buyItNowPrice" i], input[id*="buy-now-price" i], input[id*="buy_now" i], input[aria-label*="Sofort-Kaufen" i], input[data-testid*="buy-now-price" i]'
+  );
+  if (buynowPriceInput && d.buyNowPrice !== null && d.buyNowPrice !== undefined) {
+    setNativeValue(buynowPriceInput, String(d.buyNowPrice).replace(".", ","));
+  }
+}
+
+async function fillEbayDEShipping(draft, rootDoc) {
+  const doc = rootDoc || (typeof document !== "undefined" ? document : null);
+  if (!doc) return;
+
+  const presetId = draft?.ebay_de?.shipping_preset_id || "";
+  const isPickupOnly = presetId === "pickup_only_de" || draft?.ricardo?.shipping_preset_id === "pickup_only";
+
+  const buttons = Array.from(doc.querySelectorAll(".summary__shipping button, button[class*='toggle-button']"));
+  if (isPickupOnly) {
+    const pickupBtn = buttons.find(b => /nur abholung/i.test(b.textContent || ""));
+    if (pickupBtn && pickupBtn.getAttribute("aria-pressed") !== "true") {
+      pickupBtn.click();
+    }
+  } else {
+    const shipBtn = buttons.find(b => /versand und abholung/i.test(b.textContent || "")) ||
+                    buttons.find(b => /nur versand/i.test(b.textContent || ""));
+    if (shipBtn && shipBtn.getAttribute("aria-pressed") !== "true") {
+      shipBtn.click();
+    }
+  }
+}
+
 // Firefox Xray-Safe File Injector for HTMLInputElement and react-dropzone
 function injectFilesIntoInput(fileInput, imagePayloads) {
   if (!fileInput || !imagePayloads || imagePayloads.length === 0) return;
 
   try {
-    const dt = new DataTransfer();
+    const dt = typeof DataTransfer !== "undefined" ? new DataTransfer() : { items: { add: () => {} }, files: [] };
 
     for (const img of imagePayloads) {
       const bytes = dataUrlToUint8Array(img.dataUrl);
-      const file = new File([bytes], img.filename || "image.jpg", {
-        type: img.mimeType || "image/jpeg",
-        lastModified: Date.now()
-      });
+      const file = typeof File !== "undefined"
+        ? new File([bytes], img.filename || "image.jpg", {
+            type: img.mimeType || "image/jpeg",
+            lastModified: Date.now()
+          })
+        : { name: img.filename || "image.jpg", type: img.mimeType || "image/jpeg" };
       dt.items.add(file);
     }
 
@@ -512,6 +692,298 @@ function injectFilesIntoInput(fileInput, imagePayloads) {
   } catch (err) {
     console.error("[OccAIsion] Error injecting files:", err);
   }
+}
+
+// eBay.de Multi-Step Prelist & Listing Functions
+function selectEbayProductMatch(draft, data, rootDoc) {
+  const doc = rootDoc || (typeof document !== "undefined" ? document : null);
+  if (!doc) return null;
+
+  const productButtons = Array.from(doc.querySelectorAll("button.product-button, button[class*='product-button']"));
+  if (productButtons.length === 0) return null;
+
+  const queryText = [
+    (data && data.title) || "",
+    (draft && draft.identified_product) || "",
+    (draft && draft.ebay_de && draft.ebay_de.title) || "",
+    (draft && draft.user_notes) || ""
+  ].join(" ").toLowerCase();
+
+  const numbersInQuery = queryText.match(/\b\d{3,}\b/g) || [];
+  const stopWords = new Set(["der", "die", "das", "und", "für", "mit", "von", "ein", "eine", "einer", "the", "and", "for", "with"]);
+  const wordsInQuery = queryText
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .split(/\s+/)
+    .filter(w => w.length >= 3 && !stopWords.has(w));
+
+  let bestMatch = null;
+  let highestScore = -1;
+
+  for (const btn of productButtons) {
+    const btnText = (btn.textContent || "").toLowerCase();
+    let score = 0;
+
+    for (const num of numbersInQuery) {
+      if (btnText.includes(num)) {
+        score += 15;
+      }
+    }
+
+    for (const w of wordsInQuery) {
+      if (btnText.includes(w)) {
+        score += 2;
+      }
+    }
+
+    if (score > highestScore) {
+      highestScore = score;
+      bestMatch = btn;
+    }
+  }
+
+  if (bestMatch && highestScore >= 6) {
+    try {
+      const img = bestMatch.querySelector?.('img[src*="i.ebayimg.com"]') || bestMatch.querySelector?.('img');
+      const imgSrc = img?.getAttribute?.("src") || img?.src || "";
+      if (imgSrc && imgSrc.includes("i.ebayimg.com") && typeof sessionStorage !== "undefined") {
+        sessionStorage.setItem("ai_occaision_ebay_stock_img", imgSrc.replace(/\/s-l\d+\./i, "/s-l1600."));
+      }
+    } catch (_) {}
+    return { button: bestMatch, score: highestScore, isMatch: true };
+  }
+
+  return { button: null, score: highestScore, isMatch: false };
+}
+
+function extractEbayStockImageUrl(rootDoc) {
+  const doc = rootDoc || (typeof document !== "undefined" ? document : null);
+  if (!doc) return null;
+
+  // 1. Check for thumbnail button or tag with Standardbild / pictureStock
+  const candidates = [
+    ...Array.from(doc.querySelectorAll('button.uploader-thumbnails-ux__image[aria-label*="Standardbild" i]')),
+    ...Array.from(doc.querySelectorAll('button[_track*="pictureStock" i]')),
+    ...Array.from(doc.querySelectorAll('.uploader-thumbnails-ux__tag')),
+    ...Array.from(doc.querySelectorAll('button.uploader-thumbnails-ux__image')),
+    ...Array.from(doc.querySelectorAll('.imageEditor__image[style*="background-image"]'))
+  ];
+
+  for (const el of candidates) {
+    const target = (el.tagName !== "BUTTON" && typeof el.closest === "function" ? el.closest("button") : null) || el;
+    const style = target.getAttribute?.("style") || target.style?.backgroundImage || "";
+    const m = style.match(/url\(['"]?(https?:\/\/[^'")]+)['"]?\)/i);
+    if (m && m[1] && m[1].includes("i.ebayimg.com")) {
+      return m[1].replace(/\/s-l\d+\./i, "/s-l1600.");
+    }
+    const img = target.querySelector?.('img[src*="i.ebayimg.com"]') || (target.tagName === "IMG" ? target : null);
+    if (img && img.src && img.src.includes("i.ebayimg.com")) {
+      return img.src.replace(/\/s-l\d+\./i, "/s-l1600.");
+    }
+  }
+
+  // 2. Check within uploader grid
+  const uploaderGrid = doc.querySelector('.uploader-thumbnails-ux, .main-photo, [class*="uploader-thumbnails"]');
+  if (uploaderGrid) {
+    const styleEls = Array.from(uploaderGrid.querySelectorAll('[style*="background-image"]'));
+    for (const el of styleEls) {
+      const style = el.getAttribute?.("style") || el.style?.backgroundImage || "";
+      const m = style.match(/url\(['"]?(https?:\/\/[^'")]+)['"]?\)/i);
+      if (m && m[1] && m[1].includes("i.ebayimg.com")) {
+        return m[1].replace(/\/s-l\d+\./i, "/s-l1600.");
+      }
+    }
+  }
+
+  // 3. Fallback to cached URL from Step 1
+  if (typeof sessionStorage !== "undefined") {
+    try {
+      const cached = sessionStorage.getItem("ai_occaision_ebay_stock_img");
+      if (cached) return cached;
+    } catch (_) {}
+  }
+
+  return null;
+}
+
+const EBAY_AUTO_KEY = "ai_occaision_ebay_auto_step1";
+
+async function executeEbayStep1(draft, rootDoc) {
+  const doc = rootDoc || (typeof document !== "undefined" ? document : null);
+  if (!doc) return { ok: false, message: "Kein Dokument gefunden" };
+
+  const data = getPlatformData(draft, "ebay_de");
+  const actions = [];
+
+  // 1. Keyword search (Start page ebay-01)
+  const prelistFilled = await handleEbayPrelistStep1(draft, data, doc);
+  if (prelistFilled) {
+    actions.push("Titel eingegeben & Weiter geklickt");
+    let poll = 0;
+    while (poll < 4000 && !doc.querySelector("button.product-button, button.prelist-radix__next-action, .condition-dialog-radix, input[name='condition']")) {
+      await new Promise(r => setTimeout(r, 200));
+      poll += 200;
+    }
+  }
+
+  // 2. Product selection from catalog (ebay-02)
+  const productButtons = doc.querySelectorAll("button.product-button, button[class*='product-button']");
+  const fallbackBtn = doc.querySelector("button.prelist-radix__next-action, button[class*='prelist-radix'][class*='next-action']");
+  if (productButtons.length > 0 || fallbackBtn) {
+    const match = selectEbayProductMatch(draft, data, doc);
+    if (match && match.isMatch && match.button) {
+      try {
+        match.button.removeAttribute?.("disabled");
+        match.button.disabled = false;
+        try { match.button.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true })); } catch (_) {}
+        try { match.button.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true })); } catch (_) {}
+        if (typeof match.button.click === "function") match.button.click();
+        actions.push("Produkt gewählt");
+      } catch (_) {}
+    } else if (fallbackBtn) {
+      try {
+        fallbackBtn.removeAttribute?.("disabled");
+        fallbackBtn.disabled = false;
+        try { fallbackBtn.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true })); } catch (_) {}
+        try { fallbackBtn.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true })); } catch (_) {}
+        if (typeof fallbackBtn.click === "function") fallbackBtn.click();
+        actions.push("Ohne passendes Produkt weiter");
+      } catch (_) {}
+    }
+    let poll = 0;
+    while (poll < 4000 && !doc.querySelector(".condition-dialog-radix, input[name='condition']")) {
+      await new Promise(r => setTimeout(r, 200));
+      poll += 200;
+    }
+  }
+
+  // 3. Condition dialog (ebay-03 / ebay-03b)
+  const conditionHandled = await handleEbayConditionDialog(data.condition, doc);
+  if (conditionHandled) {
+    actions.push("Zustand gewählt & Weiter zum Angebot");
+    try {
+      if (typeof sessionStorage !== "undefined") {
+        sessionStorage.removeItem(EBAY_AUTO_KEY);
+      }
+    } catch (_) {}
+  }
+
+  return {
+    ok: actions.length > 0,
+    actions,
+    message: actions.length > 0 ? actions.join(" → ") : "Keine Schritt-1-Elemente gefunden"
+  };
+}
+
+async function executeEbayStep2(draft, rootDoc) {
+  const doc = rootDoc || (typeof document !== "undefined" ? document : null);
+  if (!doc) return { ok: false, message: "Kein Dokument" };
+
+  const fileInput = doc.querySelector('input[type="file"]#fehelix-uploader, input[type="file"]');
+  if (!fileInput) {
+    return { ok: false, message: "Kein Bild-Upload-Feld gefunden (erst nach Zustand-Auswahl)" };
+  }
+
+  try {
+    // 1. Fetch user draft images from backend
+    const imagesResponse = await new Promise(resolve => {
+      browserApi.runtime.sendMessage({ action: "FETCH_DRAFT_IMAGES", draftId: draft.id }, resolve);
+    });
+
+    const userImages = (imagesResponse && imagesResponse.ok && imagesResponse.images) || [];
+    const uploadQueue = [];
+    let preservedStockImage = false;
+
+    // 2. Check if there is an eBay Standardbild to preserve before uploading own images
+    let stockImageUrl = extractEbayStockImageUrl(doc);
+    if (!stockImageUrl && typeof sessionStorage !== "undefined") {
+      try {
+        stockImageUrl = sessionStorage.getItem("ai_occaision_ebay_stock_img");
+      } catch (_) {}
+    }
+
+    if (stockImageUrl) {
+      try {
+        const stockRes = await new Promise(resolve => {
+          browserApi.runtime.sendMessage(
+            { action: "FETCH_EXTERNAL_IMAGE", url: stockImageUrl, filename: "standardbild_katalog.jpg" },
+            resolve
+          );
+        });
+        if (stockRes && stockRes.ok && stockRes.dataUrl) {
+          uploadQueue.push({
+            id: "ebay_stock_image",
+            filename: stockRes.filename || "standardbild_katalog.jpg",
+            mimeType: stockRes.mimeType || "image/jpeg",
+            dataUrl: stockRes.dataUrl
+          });
+          preservedStockImage = true;
+          console.log("[OccAIsion] Standardbild erfolgreich zwischengespeichert und für Upload vorbereitet.");
+        }
+      } catch (errStock) {
+        console.warn("[OccAIsion] Standardbild konnte nicht abgerufen werden:", errStock);
+      }
+    }
+
+    // 3. Append draft images
+    for (const img of userImages) {
+      uploadQueue.push(img);
+    }
+
+    if (uploadQueue.length > 0) {
+      injectFilesIntoInput(fileInput, uploadQueue);
+      const msg = preservedStockImage
+        ? `Standardbild + ${userImages.length} eigene Bilder hochgeladen`
+        : `${userImages.length} Bilder hochgeladen`;
+      return {
+        ok: true,
+        count: uploadQueue.length,
+        hasStockImage: preservedStockImage,
+        message: msg
+      };
+    } else {
+      return { ok: false, message: "Keine Bilder im Entwurf vorhanden" };
+    }
+  } catch (err) {
+    console.warn("[OccAIsion] eBay Step 2 image upload error:", err);
+    return { ok: false, error: String(err) };
+  }
+}
+
+async function executeEbayStep3(draft, rootDoc) {
+  const doc = rootDoc || (typeof document !== "undefined" ? document : null);
+  if (!doc) return { ok: false, message: "Kein Dokument" };
+
+  const data = getPlatformData(draft, "ebay_de");
+  const actions = [];
+
+  // 1. Title
+  const titleInput = doc.querySelector(
+    'input[name="title"], input[id*="TITLE" i], input[data-testid*="title" i], input.textbox__control[maxlength="80"]'
+  );
+  if (titleInput && data.title) {
+    setNativeValue(titleInput, data.title);
+    actions.push("Titel");
+  }
+
+  // 2. Description (RTE iframe & raw textarea)
+  if (data.description) {
+    const filled = setDescriptionValue(data.description, doc);
+    if (filled) actions.push("Beschreibung");
+  }
+
+  // 3. Format & Prices
+  await fillEbayDEPricesAndFormat(draft, data, doc);
+  actions.push("Preis & Format");
+
+  // 4. Shipping
+  await fillEbayDEShipping(draft, doc);
+  actions.push("Versand");
+
+  return {
+    ok: true,
+    actions,
+    message: actions.length > 0 ? `Eingefügt: ${actions.join(", ")}` : "Formular ausgefüllt"
+  };
 }
 
 // Platform detection
@@ -576,12 +1048,14 @@ function getPlatformData(draft, platform) {
   } else if (p === "ebay_de") {
     return {
       title: draft.ebay_de ? draft.ebay_de.title : "",
+      category: draft.ebay_de ? draft.ebay_de.category_suggestion : "",
       description: draft.ebay_de ? draft.ebay_de.description : "",
       condition: draft.ebay_de ? draft.ebay_de.condition : "",
       startPrice: draft.ebay_de ? draft.ebay_de.start_price_eur : 1.0,
       buyNowPrice: draft.ebay_de ? draft.ebay_de.buynow_price_eur : 10.0,
       currency: "EUR",
-      priceType: draft.ebay_de ? draft.ebay_de.offer_type : "auction"
+      priceType: draft.ebay_de ? draft.ebay_de.offer_type : "auction",
+      shippingPresetId: draft.ebay_de ? draft.ebay_de.shipping_preset_id : "dhl_2kg"
     };
   } else if (p === "kleinanzeigen") {
     return {
@@ -610,18 +1084,11 @@ function setDescriptionValue(value, rootDoc) {
   const doc = rootDoc || (typeof document !== "undefined" ? document : null);
   if (!doc) return false;
 
-  // 1. Textarea search
-  const textarea = doc.querySelector(
-    '#pstad-descrptn, #pstad-descr, textarea[name*="description" i], textarea[name="body"], textarea[id*="description" i], textarea[placeholder*="beschreibung" i], textarea[data-testid*="description" i]'
-  );
-  if (textarea) {
-    setNativeValue(textarea, value);
-    return true;
-  }
+  let filled = false;
 
-  // 2. Same-origin iframe search (e.g. eBay.de)
+  // 1. Same-origin iframe search (e.g. eBay.de Rich-Text-Editor)
   const iframes = doc.querySelectorAll(
-    'iframe.ux-action-menu__iframe, iframe[id*="desc" i], iframe[title*="Beschreibung" i], iframe[title*="description" i]'
+    'iframe#se-rte-frame__summary, iframe.ux-action-menu__iframe, iframe[id*="desc" i], iframe[title*="Beschreibung" i], iframe[title*="description" i]'
   );
   for (const iframe of iframes) {
     try {
@@ -644,7 +1111,7 @@ function setDescriptionValue(value, rootDoc) {
           editable.dispatchEvent(new Event("input", { bubbles: true }));
           editable.dispatchEvent(new Event("change", { bubbles: true }));
           editable.dispatchEvent(new Event("blur", { bubbles: true }));
-          return true;
+          filled = true;
         }
       }
     } catch (e) {
@@ -652,16 +1119,27 @@ function setDescriptionValue(value, rootDoc) {
     }
   }
 
-  // 3. Direct contenteditable editor in document
-  const contentEditable = doc.querySelector('[contenteditable="true"]');
-  if (contentEditable) {
-    contentEditable.textContent = value;
-    contentEditable.dispatchEvent(new Event("input", { bubbles: true }));
-    contentEditable.dispatchEvent(new Event("blur", { bubbles: true }));
-    return true;
+  // 2. Textarea search (standard or raw editor sync)
+  const textareas = doc.querySelectorAll(
+    '#pstad-descrptn, #pstad-descr, textarea[name*="description" i], textarea[name="body"], textarea[id*="description" i], textarea[placeholder*="beschreibung" i], textarea[data-testid*="description" i]'
+  );
+  for (const textarea of textareas) {
+    setNativeValue(textarea, value);
+    filled = true;
   }
 
-  return false;
+  // 3. Direct contenteditable editor in document
+  if (!filled) {
+    const contentEditable = doc.querySelector('[contenteditable="true"]');
+    if (contentEditable) {
+      contentEditable.textContent = value;
+      contentEditable.dispatchEvent(new Event("input", { bubbles: true }));
+      contentEditable.dispatchEvent(new Event("blur", { bubbles: true }));
+      filled = true;
+    }
+  }
+
+  return filled;
 }
 
 // Smart-Panel UI Creation & State
@@ -669,13 +1147,100 @@ let panelElement = null;
 let currentDrafts = [];
 let activeDraft = null;
 
+function checkAndResumeEbayAutoStep1() {
+  if (detectPlatform() !== "ebay_de") return;
+  const raw = typeof sessionStorage !== "undefined" ? sessionStorage.getItem(EBAY_AUTO_KEY) : null;
+  if (!raw) return;
+
+  try {
+    const autoData = JSON.parse(raw);
+    if (!autoData || !autoData.draftId || Date.now() - autoData.startedAt > 60000) {
+      sessionStorage.removeItem(EBAY_AUTO_KEY);
+      return;
+    }
+
+    // Check if we already reached ebay-04 (final editor page)
+    const isEbay04 = document.querySelector(
+      'input[type="file"]#fehelix-uploader, input[name="startPrice"], iframe#se-rte-frame__summary'
+    );
+    if (isEbay04) {
+      sessionStorage.removeItem(EBAY_AUTO_KEY);
+      const step1Btn = document.getElementById("ai-ext-step1-btn");
+      if (step1Btn) step1Btn.textContent = "✓ Schritt 1 abgeschlossen";
+      return;
+    }
+
+    const draft = (currentDrafts && currentDrafts.find(d => d.id === autoData.draftId)) || activeDraft;
+    if (draft) {
+      console.log("[OccAIsion] Setze eBay Schritt 1 automatisch fort...");
+      const step1Btn = document.getElementById("ai-ext-step1-btn");
+      if (step1Btn) {
+        step1Btn.disabled = true;
+        step1Btn.textContent = "⏳ Automatische Fortsetzung...";
+      }
+      setTimeout(async () => {
+        try {
+          const res = await executeEbayStep1(draft);
+          if (step1Btn) {
+            step1Btn.textContent = res && res.ok ? "✓ " + res.message : "✓ Schritt 1 ausgeführt";
+          }
+        } catch (e) {
+          console.warn("[OccAIsion] Auto-resume error:", e);
+        } finally {
+          if (step1Btn) {
+            step1Btn.disabled = false;
+            setTimeout(() => {
+              step1Btn.textContent = "▶ Schritt 1: Titel & Produkt-Auswahl";
+            }, 4000);
+          }
+        }
+      }, 400);
+    }
+  } catch (e) {
+    try { sessionStorage.removeItem(EBAY_AUTO_KEY); } catch (_) {}
+  }
+}
+
 function createSmartPanel() {
   if (!isRicardo() && !isTutti() && !isEbayDE() && !isKleinanzeigen()) return;
   if (document.getElementById("ai-listing-smart-panel")) return;
 
   const platform = detectPlatform();
-  const step1BtnText = platform === "tutti" ? "▶ Schritt 1: Kategorie & Bilder" : "▶ Schritt 1: Bilder & Titel einfügen";
-  const step2BtnText = platform === "tutti" ? "▶ Schritt 2: Alle Textfelder einfügen" : "▶ Schritt 2: Beschreibung, Zustand & Preis";
+  let wizardActionsHtml = "";
+
+  if (platform === "ebay_de") {
+    wizardActionsHtml = `
+      <div class="ai-wizard-actions">
+        <button id="ai-ext-step1-btn" class="ai-btn ai-btn-primary" title="Titel suchen, Produkt im Katalog auswählen & Zustand bestätigen">
+          ▶ Schritt 1: Titel & Produkt-Auswahl
+        </button>
+        <button id="ai-ext-step2-btn" class="ai-btn ai-btn-amber" title="Fotos hochladen (Maske passt sich an)">
+          ▶ Schritt 2: Bilder hochladen
+        </button>
+        <button id="ai-ext-step3-btn" class="ai-btn ai-btn-secondary" title="Beschreibung, Preise und Versandoptionen einfügen">
+          ▶ Schritt 3: Angaben einfügen
+        </button>
+      </div>
+    `;
+  } else {
+    const step1BtnText = platform === "tutti"
+      ? "▶ Schritt 1: Kategorie & Bilder"
+      : "▶ Schritt 1: Bilder & Titel einfügen";
+    const step2BtnText = platform === "tutti"
+      ? "▶ Schritt 2: Alle Textfelder einfügen"
+      : "▶ Schritt 2: Beschreibung, Zustand & Preis";
+
+    wizardActionsHtml = `
+      <div class="ai-wizard-actions">
+        <button id="ai-ext-step1-btn" class="ai-btn ai-btn-primary">
+          ${step1BtnText}
+        </button>
+        <button id="ai-ext-step2-btn" class="ai-btn ai-btn-secondary">
+          ${step2BtnText}
+        </button>
+      </div>
+    `;
+  }
 
   panelElement = document.createElement("div");
   panelElement.id = "ai-listing-smart-panel";
@@ -697,14 +1262,7 @@ function createSmartPanel() {
         </div>
       </div>
 
-      <div class="ai-wizard-actions">
-        <button id="ai-ext-step1-btn" class="ai-btn ai-btn-primary">
-          ${step1BtnText}
-        </button>
-        <button id="ai-ext-step2-btn" class="ai-btn ai-btn-secondary">
-          ${step2BtnText}
-        </button>
-      </div>
+      ${wizardActionsHtml}
 
       <div class="ai-copy-fallbacks">
         <span class="ai-fallback-title">📋 1-Klick-Kopieren (Fallback):</span>
@@ -735,75 +1293,173 @@ function createSmartPanel() {
   document.body.appendChild(panelElement);
   bindPanelEvents();
   fetchDraftsList();
+  checkAndResumeEbayAutoStep1();
 }
 
 function bindPanelEvents() {
   const collapseBtn = document.getElementById("ai-ext-collapse-btn");
   const panelBody = document.getElementById("ai-panel-body");
-  collapseBtn.onclick = () => {
-    panelBody.classList.toggle("ai-hidden");
-    collapseBtn.textContent = panelBody.classList.contains("ai-hidden") ? "▲" : "_";
-  };
+  if (collapseBtn && panelBody) {
+    collapseBtn.onclick = () => {
+      panelBody.classList.toggle("ai-hidden");
+      collapseBtn.textContent = panelBody.classList.contains("ai-hidden") ? "▲" : "_";
+    };
+  }
 
   const refreshBtn = document.getElementById("ai-ext-refresh-btn");
-  refreshBtn.onclick = fetchDraftsList;
+  if (refreshBtn) refreshBtn.onclick = fetchDraftsList;
 
   const draftSelect = document.getElementById("ai-ext-draft-select");
-  draftSelect.onchange = () => {
-    const selectedId = draftSelect.value;
-    activeDraft = currentDrafts.find(d => d.id === selectedId) || null;
-  };
+  if (draftSelect) {
+    draftSelect.onchange = () => {
+      const selectedId = draftSelect.value;
+      activeDraft = currentDrafts.find(d => d.id === selectedId) || null;
+    };
+  }
 
-  // Step 1: Category & Images
+  // Step 1: Category & Images (or Title & Prelist on eBay.de)
   const step1Btn = document.getElementById("ai-ext-step1-btn");
-  step1Btn.onclick = async () => {
-    if (!activeDraft) {
-      alert("Bitte wähle zuerst einen Entwurf aus oder öffne 127.0.0.1:8000 zur Kopplung.");
-      return;
-    }
-    const platform = detectPlatform();
-    step1Btn.disabled = true;
-    step1Btn.textContent = platform === "tutti" ? "⏳ Wähle Kategorie & lade Bilder..." : "⏳ Lade Bilder & fülle Titel...";
-    try {
-      await executeStep1(activeDraft);
-      if (platform === "tutti") {
-        const listingTypeInput = document.querySelector('input[name="listingType"]');
-        if (listingTypeInput && listingTypeInput.value && listingTypeInput.value.trim() !== "") {
-          step1Btn.textContent = "✓ Kategorie & Bilder eingefügt";
-        } else {
-          step1Btn.textContent = "⚠ Bitte Kategorie manuell wählen";
-        }
-      } else {
-        step1Btn.textContent = "✓ Bilder & Titel eingefügt";
+  if (step1Btn) {
+    step1Btn.onclick = async () => {
+      if (!activeDraft) {
+        alert("Bitte wähle zuerst einen Entwurf aus oder öffne 127.0.0.1:8000 zur Kopplung.");
+        return;
       }
-    } finally {
-      step1Btn.disabled = false;
-      setTimeout(() => {
-        step1Btn.textContent = platform === "tutti" ? "▶ Schritt 1: Kategorie & Bilder" : "▶ Schritt 1: Bilder & Titel einfügen";
-      }, 4000);
-    }
-  };
+      const platform = detectPlatform();
+      step1Btn.disabled = true;
 
-  // Step 2: Description & Price & all other fields
+      if (platform === "ebay_de") {
+        try {
+          if (typeof sessionStorage !== "undefined") {
+            sessionStorage.setItem(EBAY_AUTO_KEY, JSON.stringify({
+              draftId: activeDraft.id,
+              startedAt: Date.now()
+            }));
+          }
+        } catch (_) {}
+        step1Btn.textContent = "⏳ Führe alle 4 Schritte aus...";
+        try {
+          const res = await executeEbayStep1(activeDraft);
+          if (res && res.message) {
+            step1Btn.textContent = "✓ " + res.message;
+          } else {
+            step1Btn.textContent = "✓ Schritt 1 ausgeführt";
+          }
+        } catch (err) {
+          console.warn("[OccAIsion] eBay Step 1 error:", err);
+          step1Btn.textContent = "⚠ Fehler in Schritt 1";
+        } finally {
+          step1Btn.disabled = false;
+          setTimeout(() => {
+            step1Btn.textContent = "▶ Schritt 1: Titel & Produkt-Auswahl";
+          }, 4000);
+        }
+        return;
+      }
+
+      step1Btn.textContent = platform === "tutti"
+        ? "⏳ Wähle Kategorie & lade Bilder..."
+        : "⏳ Lade Bilder & fülle Titel...";
+      try {
+        await executeStep1(activeDraft);
+        if (platform === "tutti") {
+          const listingTypeInput = document.querySelector('input[name="listingType"]');
+          if (listingTypeInput && listingTypeInput.value && listingTypeInput.value.trim() !== "") {
+            step1Btn.textContent = "✓ Kategorie & Bilder eingefügt";
+          } else {
+            step1Btn.textContent = "⚠ Bitte Kategorie manuell wählen";
+          }
+        } else {
+          step1Btn.textContent = "✓ Bilder & Titel eingefügt";
+        }
+      } finally {
+        step1Btn.disabled = false;
+        setTimeout(() => {
+          step1Btn.textContent = platform === "tutti"
+            ? "▶ Schritt 1: Kategorie & Bilder"
+            : "▶ Schritt 1: Bilder & Titel einfügen";
+        }, 4000);
+      }
+    };
+  }
+
+  // Step 2: Description & Price & all other fields (or Photos on eBay.de)
   const step2Btn = document.getElementById("ai-ext-step2-btn");
-  step2Btn.onclick = async () => {
-    if (!activeDraft) {
-      alert("Bitte wähle zuerst einen Entwurf aus oder öffne 127.0.0.1:8000 zur Kopplung.");
-      return;
-    }
-    const platform = detectPlatform();
-    step2Btn.disabled = true;
-    step2Btn.textContent = "⏳ Fülle Textfelder aus...";
-    try {
-      await executeStep2(activeDraft);
-      step2Btn.textContent = "✓ Textfelder eingefügt";
-    } finally {
-      step2Btn.disabled = false;
-      setTimeout(() => {
-        step2Btn.textContent = platform === "tutti" ? "▶ Schritt 2: Alle Textfelder einfügen" : "▶ Schritt 2: Beschreibung, Zustand & Preis";
-      }, 4000);
-    }
-  };
+  if (step2Btn) {
+    step2Btn.onclick = async () => {
+      if (!activeDraft) {
+        alert("Bitte wähle zuerst einen Entwurf aus oder öffne 127.0.0.1:8000 zur Kopplung.");
+        return;
+      }
+      const platform = detectPlatform();
+      step2Btn.disabled = true;
+
+      if (platform === "ebay_de") {
+        step2Btn.textContent = "⏳ Lade Bilder hoch...";
+        try {
+          const res = await executeEbayStep2(activeDraft);
+          if (res && res.ok && res.count) {
+            step2Btn.textContent = `✓ ${res.count} Bilder hochgeladen`;
+          } else if (res && res.message) {
+            step2Btn.textContent = (res.ok ? "✓ " : "⚠ ") + res.message;
+          } else {
+            step2Btn.textContent = "✓ Bilder hochgeladen";
+          }
+        } catch (err) {
+          console.warn("[OccAIsion] eBay Step 2 error:", err);
+          step2Btn.textContent = "⚠ Fehler beim Bild-Upload";
+        } finally {
+          step2Btn.disabled = false;
+          setTimeout(() => {
+            step2Btn.textContent = "▶ Schritt 2: Bilder hochladen";
+          }, 4000);
+        }
+        return;
+      }
+
+      step2Btn.textContent = "⏳ Fülle Textfelder aus...";
+      try {
+        await executeStep2(activeDraft);
+        step2Btn.textContent = "✓ Textfelder eingefügt";
+      } finally {
+        step2Btn.disabled = false;
+        setTimeout(() => {
+          step2Btn.textContent = platform === "tutti"
+            ? "▶ Schritt 2: Alle Textfelder einfügen"
+            : "▶ Schritt 2: Beschreibung, Zustand & Preis";
+        }, 4000);
+      }
+    };
+  }
+
+  // Step 3 (eBay.de): Form fields (Title, Description, Prices & Format, Shipping)
+  const step3Btn = document.getElementById("ai-ext-step3-btn");
+  if (step3Btn) {
+    step3Btn.onclick = async () => {
+      if (!activeDraft) {
+        alert("Bitte wähle zuerst einen Entwurf aus oder öffne 127.0.0.1:8000 zur Kopplung.");
+        return;
+      }
+      step3Btn.disabled = true;
+      step3Btn.textContent = "⏳ Fülle restliche Angaben...";
+      try {
+        const res = await executeEbayStep3(activeDraft);
+        if (res && res.message) {
+          step3Btn.textContent = "✓ " + res.message;
+        } else {
+          step3Btn.textContent = "✓ Angaben eingefügt";
+        }
+      } catch (err) {
+        console.warn("[OccAIsion] eBay Step 3 error:", err);
+        step3Btn.textContent = "⚠ Fehler beim Einfügen";
+      } finally {
+        step3Btn.disabled = false;
+        setTimeout(() => {
+          step3Btn.textContent = "▶ Schritt 3: Angaben einfügen";
+        }, 4000);
+      }
+    };
+  }
 
   // 1-Click Copy fallbacks (navigator.clipboard)
   const copyCatBtn = document.getElementById("ai-copy-cat-btn");
@@ -815,29 +1471,41 @@ function bindPanelEvents() {
     };
   }
 
-  document.getElementById("ai-copy-title-btn").onclick = () => {
-    if (!activeDraft) return;
-    const data = getPlatformData(activeDraft);
-    navigator.clipboard.writeText(data.title || "");
-  };
+  const copyTitleBtn = document.getElementById("ai-copy-title-btn");
+  if (copyTitleBtn) {
+    copyTitleBtn.onclick = () => {
+      if (!activeDraft) return;
+      const data = getPlatformData(activeDraft);
+      navigator.clipboard.writeText(data.title || "");
+    };
+  }
 
-  document.getElementById("ai-copy-desc-btn").onclick = () => {
-    if (!activeDraft) return;
-    const data = getPlatformData(activeDraft);
-    navigator.clipboard.writeText(data.description || "");
-  };
+  const copyDescBtn = document.getElementById("ai-copy-desc-btn");
+  if (copyDescBtn) {
+    copyDescBtn.onclick = () => {
+      if (!activeDraft) return;
+      const data = getPlatformData(activeDraft);
+      navigator.clipboard.writeText(data.description || "");
+    };
+  }
 
-  document.getElementById("ai-copy-start-btn").onclick = () => {
-    if (!activeDraft) return;
-    const data = getPlatformData(activeDraft);
-    navigator.clipboard.writeText(String(data.startPrice || 1));
-  };
+  const copyStartBtn = document.getElementById("ai-copy-start-btn");
+  if (copyStartBtn) {
+    copyStartBtn.onclick = () => {
+      if (!activeDraft) return;
+      const data = getPlatformData(activeDraft);
+      navigator.clipboard.writeText(String(data.startPrice || 1));
+    };
+  }
 
-  document.getElementById("ai-copy-buynow-btn").onclick = () => {
-    if (!activeDraft) return;
-    const data = getPlatformData(activeDraft);
-    navigator.clipboard.writeText(String(data.buyNowPrice || 10));
-  };
+  const copyBuyNowBtn = document.getElementById("ai-copy-buynow-btn");
+  if (copyBuyNowBtn) {
+    copyBuyNowBtn.onclick = () => {
+      if (!activeDraft) return;
+      const data = getPlatformData(activeDraft);
+      navigator.clipboard.writeText(String(data.buyNowPrice || 10));
+    };
+  }
 }
 
 function fetchDraftsList() {
@@ -860,6 +1528,7 @@ function fetchDraftsList() {
         draftSelect.appendChild(opt);
       });
       activeDraft = currentDrafts[0];
+      checkAndResumeEbayAutoStep1();
     } else if (response && (response.unauthorized || (response.error && response.error.includes("401")))) {
       draftSelect.innerHTML = '<option value="">⚠️ Nicht gekoppelt: Einmalig 127.0.0.1:8000 im Browser öffnen</option>';
       activeDraft = null;
@@ -872,6 +1541,9 @@ function fetchDraftsList() {
 
 async function executeStep1(draft) {
   const platform = detectPlatform();
+  if (platform === "ebay_de") {
+    return await executeEbayStep1(draft);
+  }
   const data = getPlatformData(draft);
 
   // 1. Fetch images through background worker (bypassing CORS)
@@ -881,7 +1553,7 @@ async function executeStep1(draft) {
     });
 
     if (imagesResponse && imagesResponse.ok && imagesResponse.images && imagesResponse.images.length > 0) {
-      const fileInput = document.querySelector('input[type="file"]');
+      const fileInput = document.querySelector('input[type="file"]#fehelix-uploader, input[type="file"]');
       if (fileInput) {
         injectFilesIntoInput(fileInput, imagesResponse.images);
       }
@@ -890,24 +1562,31 @@ async function executeStep1(draft) {
     console.warn("[OccAIsion] Error fetching/injecting images in Step 1:", err);
   }
 
-  // 2. Platform specific assistance in Step 1: Category on Tutti
+  // 2. Platform specific assistance in Step 1: Category on Tutti / Prelist & Condition on eBay DE
   if (platform === "tutti") {
     try {
       await autoSelectTuttiCategory(data.category, draft.identified_product || data.title);
     } catch (err) {
       console.warn("[OccAIsion] Tutti category selection error:", err);
     }
+  } else if (platform === "ebay_de") {
+    try {
+      await handleEbayPrelistStep1(draft, data);
+      await handleEbayConditionDialog(data.condition);
+    } catch (err) {
+      console.warn("[OccAIsion] eBay DE prelist/condition error:", err);
+    }
   }
 
   // 3. Inject Title (if present in DOM)
   const titleInput = document.querySelector(
-    'input[name="subject"], #postad-title, #pstad-title, input[name="title"], input[name="pstad-title"], input[name*="title" i], input[id*="title" i], input[aria-label*="Titel" i], input[placeholder*="titel" i], input[data-testid*="title" i]'
+    'input[name="title"], input[name="subject"], #postad-title, #pstad-title, input[name="pstad-title"], input[name*="title" i], input[id*="title" i], input[aria-label*="Titel" i], input[placeholder*="titel" i], input[data-testid*="title" i]'
   );
   if (titleInput && data.title) {
     setNativeValue(titleInput, data.title);
   }
 
-  // 4. On Ricardo, if price/shipping fields are already present in DOM during Step 1, fill them as well
+  // 4. On Ricardo & eBay DE, if price/shipping fields are already present in DOM during Step 1, fill them as well
   if (platform === "ricardo") {
     try {
       await fillRicardoPrices(draft, data);
@@ -915,15 +1594,25 @@ async function executeStep1(draft) {
     } catch (e) {
       console.warn("[OccAIsion] Step 1 Ricardo price/shipping fill warning:", e);
     }
+  } else if (platform === "ebay_de") {
+    try {
+      await fillEbayDEPricesAndFormat(draft, data);
+      await fillEbayDEShipping(draft);
+    } catch (e) {
+      console.warn("[OccAIsion] Step 1 eBay DE price/shipping fill warning:", e);
+    }
   }
 }
 
 async function executeStep2(draft) {
-  const data = getPlatformData(draft);
   const platform = detectPlatform();
+  if (platform === "ebay_de") {
+    return await executeEbayStep3(draft);
+  }
+  const data = getPlatformData(draft);
 
   // 1. Photos: If file input is present and has no files, inject images automatically
-  const fileInput = document.querySelector('input[type="file"]');
+  const fileInput = document.querySelector('input[type="file"]#fehelix-uploader, input[type="file"]');
   if (fileInput && (!fileInput.files || fileInput.files.length === 0)) {
     try {
       const imagesResponse = await new Promise(resolve => {
@@ -939,7 +1628,7 @@ async function executeStep2(draft) {
 
   // 2. Title: Fill if title input exists and is empty (crucial for Tutti where title is revealed after category selection)
   const titleInput = document.querySelector(
-    'input[name="subject"], #postad-title, #pstad-title, input[name="title"], input[name="pstad-title"], input[name*="title" i], input[id*="title" i], input[aria-label*="Titel" i], input[placeholder*="titel" i], input[data-testid*="title" i]'
+    'input[name="title"], input[name="subject"], #postad-title, #pstad-title, input[name="pstad-title"], input[name*="title" i], input[id*="title" i], input[aria-label*="Titel" i], input[placeholder*="titel" i], input[data-testid*="title" i]'
   );
   if (titleInput && data.title && (!titleInput.value || titleInput.value.trim() === "")) {
     setNativeValue(titleInput, data.title);
@@ -974,6 +1663,12 @@ async function executeStep2(draft) {
         }
       });
       await new Promise(r => setTimeout(r, 120));
+    }
+  } else if (platform === "ebay_de") {
+    try {
+      await handleEbayConditionDialog(data.condition);
+    } catch (e) {
+      console.warn("[OccAIsion] eBay DE condition dialog warning:", e);
     }
   } else {
     const condEl = document.querySelector(
@@ -1011,24 +1706,19 @@ async function executeStep2(draft) {
     } catch (e) {
       console.warn("[OccAIsion] Ricardo shipping config warning:", e);
     }
+  } else if (platform === "ebay_de") {
+    try {
+      await fillEbayDEShipping(draft);
+    } catch (e) {
+      console.warn("[OccAIsion] eBay DE shipping config warning:", e);
+    }
   }
 
   // 6. Prices
   if (platform === "ricardo") {
     await fillRicardoPrices(draft, data);
   } else if (platform === "ebay_de") {
-    const startPriceInput = document.querySelector(
-      'input[name*="startPrice" i], input[id*="start-price" i], input[id*="start_price" i], input[aria-label*="Startpreis" i], input[data-testid*="start-price" i]'
-    );
-    if (startPriceInput && data.startPrice !== null && data.startPrice !== undefined) {
-      setNativeValue(startPriceInput, data.startPrice);
-    }
-    const buynowPriceInput = document.querySelector(
-      'input[name*="buyNowPrice" i], input[name*="buyItNowPrice" i], input[id*="buy-now-price" i], input[id*="buy_now" i], input[aria-label*="Sofort-Kaufen" i], input[data-testid*="buy-now-price" i], input[name="price"]'
-    );
-    if (buynowPriceInput && data.buyNowPrice !== null && data.buyNowPrice !== undefined) {
-      setNativeValue(buynowPriceInput, data.buyNowPrice);
-    }
+    await fillEbayDEPricesAndFormat(draft, data);
   } else {
     // tutti or kleinanzeigen
     const priceInput = document.querySelector(
@@ -1552,6 +2242,17 @@ if (typeof module !== "undefined" && module.exports) {
     getPlatformData,
     fillRicardoPrices,
     fillRicardoShipping,
+    handleEbayPrelistStep1,
+    handleEbayConditionDialog,
+    selectEbayProductMatch,
+    extractEbayStockImageUrl,
+    executeEbayStep1,
+    executeEbayStep2,
+    executeEbayStep3,
+    fillEbayDEPricesAndFormat,
+    fillEbayDEShipping,
     fetchDraftsList,
+    checkAndResumeEbayAutoStep1,
+    EBAY_AUTO_KEY,
   };
 }
