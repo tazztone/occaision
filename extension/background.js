@@ -304,10 +304,6 @@ function logExtractedItems(sourceKey, label, items, currency = "EUR", isSingleTo
   }
 }
 
-function logEbayExtractedItems(items) {
-  logExtractedItems("ebay_de_sold", "verkaufte Artikel", items, "€");
-}
-
 function extractKleinanzeigenItems(content) {
   if (!content) return [];
 
@@ -440,10 +436,6 @@ function extractKleinanzeigenItems(content) {
   return [];
 }
 
-function logKleinanzeigenExtractedItems(items) {
-  logExtractedItems("kleinanzeigen", "Kleinanzeigen-Artikel", items, "€");
-}
-
 function extractRicardoItems(html, priceNodes = [], ricardoCards = []) {
   const items = [];
   const seenUrls = new Set();
@@ -544,10 +536,6 @@ function extractRicardoItems(html, priceNodes = [], ricardoCards = []) {
   return items.slice(0, 30);
 }
 
-function logRicardoExtractedItems(items) {
-  logExtractedItems("ricardo", "Ricardo-Angebote", items, "CHF");
-}
-
 function extractTuttiItems(html, priceNodes = [], tuttiCards = []) {
   const items = [];
   const seenUrls = new Set();
@@ -622,10 +610,6 @@ function extractTuttiItems(html, priceNodes = [], tuttiCards = []) {
   }
 
   return items.slice(0, 30);
-}
-
-function logTuttiExtractedItems(items) {
-  logExtractedItems("tutti", "Tutti.ch Inserate", items, "CHF");
 }
 
 function findIdealoProductsInNextData(obj) {
@@ -796,10 +780,6 @@ function extractIdealoItems(html, priceNodes = [], idealoCards = []) {
   return [];
 }
 
-function logIdealoExtractedItems(items) {
-  logExtractedItems("idealo", "Idealo Neupreis", items, "€", true);
-}
-
 function extractToppreiseItems(html, priceNodes = [], toppreiseCards = []) {
   const items = [];
 
@@ -896,10 +876,6 @@ function extractToppreiseItems(html, priceNodes = [], toppreiseCards = []) {
   }
 
   return [];
-}
-
-function logToppreiseExtractedItems(items) {
-  logExtractedItems("toppreise", "Toppreise Neupreis", items, "CHF", true);
 }
 
 function extractDigitecItems(html, priceNodes = [], digitecCards = []) {
@@ -1000,10 +976,6 @@ function extractDigitecItems(html, priceNodes = [], digitecCards = []) {
   }
 
   return [];
-}
-
-function logDigitecExtractedItems(items) {
-  logExtractedItems("digitec", "Galaxus/Digitec Neupreis", items, "CHF", true);
 }
 
 function extractPricesFromHtml(sourceId, html) {
@@ -1852,18 +1824,18 @@ async function scrapeSourceHybrid(sourceConfig, query, eurToChfRate = 0.94, keep
   if (sourceConfig.id === "ebay_de_sold") {
     if (ebayItems && ebayItems.length > 0) {
       extra.items = ebayItems;
-      logEbayExtractedItems(ebayItems);
+      logExtractedItems("ebay_de_sold", "verkaufte Artikel", ebayItems, "€");
     }
   } else if (sourceConfig.id === "kleinanzeigen") {
     if (kleinanzeigenItems && kleinanzeigenItems.length > 0) {
       extra.items = kleinanzeigenItems;
-      logKleinanzeigenExtractedItems(kleinanzeigenItems);
+      logExtractedItems("kleinanzeigen", "Kleinanzeigen-Artikel", kleinanzeigenItems, "€");
     }
     extra.query = query || "";
   } else if (sourceConfig.id === "idealo") {
     if (idealoItems && idealoItems.length > 0) {
       extra.items = idealoItems;
-      logIdealoExtractedItems(idealoItems);
+      logExtractedItems("idealo", "Idealo Neupreis", idealoItems, "€", true);
       const matched = selectBestMatchingItem(idealoItems, query);
       extra.confidence = matched ? calculateTokenOverlap(query, matched.title || "") : 1.0;
       prices = matched ? [matched.price] : [idealoItems[0].price];
@@ -1871,7 +1843,7 @@ async function scrapeSourceHybrid(sourceConfig, query, eurToChfRate = 0.94, keep
   } else if (sourceConfig.id === "toppreise") {
     if (toppreiseItems && toppreiseItems.length > 0) {
       extra.items = toppreiseItems;
-      logToppreiseExtractedItems(toppreiseItems);
+      logExtractedItems("toppreise", "Toppreise Neupreis", toppreiseItems, "CHF", true);
       const matched = selectBestMatchingItem(toppreiseItems, query);
       extra.confidence = matched ? calculateTokenOverlap(query, matched.title || "") : 1.0;
       prices = matched ? [matched.price] : [toppreiseItems[0].price];
@@ -1879,7 +1851,7 @@ async function scrapeSourceHybrid(sourceConfig, query, eurToChfRate = 0.94, keep
   } else if (sourceConfig.id === "digitec") {
     if (digitecItems && digitecItems.length > 0) {
       extra.items = digitecItems;
-      logDigitecExtractedItems(digitecItems);
+      logExtractedItems("digitec", "Galaxus/Digitec Neupreis", digitecItems, "CHF", true);
       const matched = selectBestMatchingItem(digitecItems, query);
       extra.confidence = matched ? calculateTokenOverlap(query, matched.title || "") : 1.0;
       prices = matched ? [matched.price] : [digitecItems[0].price];
@@ -1887,12 +1859,12 @@ async function scrapeSourceHybrid(sourceConfig, query, eurToChfRate = 0.94, keep
   } else if (sourceConfig.id === "ricardo") {
     if (ricardoItems && ricardoItems.length > 0) {
       extra.items = ricardoItems;
-      logRicardoExtractedItems(ricardoItems);
+      logExtractedItems("ricardo", "Ricardo-Angebote", ricardoItems, "CHF");
     }
   } else if (sourceConfig.id === "tutti") {
     if (tuttiItems && tuttiItems.length > 0) {
       extra.items = tuttiItems;
-      logTuttiExtractedItems(tuttiItems);
+      logExtractedItems("tutti", "Tutti.ch Inserate", tuttiItems, "CHF");
     }
   }
 
@@ -2119,19 +2091,13 @@ if (typeof module !== "undefined" && module.exports) {
     isEbayLoginRequired,
     extractPricesFromHtml,
     extractEbayItemsFromHtml,
-    logEbayExtractedItems,
     extractKleinanzeigenItems,
-    logKleinanzeigenExtractedItems,
     extractIdealoItems,
-    logIdealoExtractedItems,
     extractToppreiseItems,
-    logToppreiseExtractedItems,
     extractDigitecItems,
-    logDigitecExtractedItems,
     extractRicardoItems,
-    logRicardoExtractedItems,
     extractTuttiItems,
-    logTuttiExtractedItems,
+    logExtractedItems,
     calculateTokenOverlap,
     selectBestMatchingItem,
     computeSourceStats,
